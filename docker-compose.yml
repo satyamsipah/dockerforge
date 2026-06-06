@@ -1,0 +1,70 @@
+# DockerForge — production stack
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │  Docker-socket mount vs Docker-in-Docker (DinD) — design rationale      │
+# │                                                                           │
+# │  DockerForge needs to run `docker build` and `docker run` from inside    │
+# │  its own container.  Two approaches exist:                                │
+# │                                                                           │
+# │  Socket mount (this file):                                                │
+# │    - Mount /var/run/docker.sock from the host into the backend container. │
+# │    - `docker` CLI calls go to the *host* daemon — built images appear     │
+# │      in the host's image store, not inside the container.                 │
+# │    - Pros: simple, no privilege escalation, widely used in CI (Jenkins,   │
+# │      GitHub Actions self-hosted runners, GitLab runners).                 │
+# │    - Cons: the container gets full daemon access — a compromised agent    │
+# │      could escape to the host by running a privileged container.          │
+# │      Mitigated here by the SSRF guard (GitHub-only URLs) and resource     │
+# │      limits (--memory / --cpus) applied to every spawned container.       │
+# │                                                                           │
+# │  Docker-in-Docker (DinD):                                                 │
+# │    - Run a separate `docker:dind` sidecar with --privileged.              │
+# │    - Point DOCKER_HOST at the sidecar's TCP endpoint.                     │
+# │    - Pros: daemon isolation — the agent's images stay in its own daemon.  │
+# │    - Cons: --privileged is a stronger escalation path than socket mount;  │
+# │      image layers are not shared with the host cache (slower builds);     │
+# │      the sidecar needs its own resource limits.                           │
+# │                                                                           │
+# │  Verdict: socket mount is the pragmatic choice for a single-host deploy.  │
+# │  Switch to DinD only if you need full daemon isolation in a              │
+# │  multi-tenant environment.                                                │
+# └─────────────────────────────────────────────────────────────────────────┘
+
+services:
+  backend:
+    build:
+      context: ./backend
+      args:
+        # Match the docker group GID on your host so the non-root appuser
+        # can access /var/run/docker.sock.  Run:
+        #   export DOCKER_GID=$(getent group docker | cut -d: -f3)
+        # before `docker compose up`, or set it in your shell profile.
+        DOCKER_GID: "${DOCKER_GID:-999}"
+    env_file:
+      - path: .env
+        required: false   # create from .env.example before first run
+    environment:
+      # When the frontend is served by nginx on port 3000, the browser's
+      # origin is http://localhost:3000 — add it to CORS allowlist.
+      CORS_ORIGINS: "http://localhost:3000"
+    volumes:
+      # Host socket mount — see rationale above.
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - forge-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:80"
+    networks:
+      - forge-net
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+networks:
+  forge-net:
+    driver: bridge
