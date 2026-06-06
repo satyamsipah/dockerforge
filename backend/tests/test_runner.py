@@ -15,7 +15,14 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from app.agent.runner import RunError, RunResult, _start_detached, run_and_verify
+from app.agent.runner import (
+    RunError,
+    RunResult,
+    _start_detached,
+    _verify_http,
+    _verify_tcp,
+    run_and_verify,
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -225,3 +232,36 @@ def test_http_verify_receives_host_port_not_container_port(mock_run, mock_query)
         emit_log=lambda _: None,
     )
     assert host_port == 49152   # NOT 3000
+
+
+# ── Container-exit fast-fail ──────────────────────────────────────────────────
+
+
+@patch("app.agent.runner.time.sleep")
+@patch("app.agent.runner._is_container_running", return_value=False)
+@patch("app.agent.runner._docker_logs", return_value="Error: DATABASE_URL not set\nExiting.")
+@patch("httpx.get", side_effect=OSError("Connection reset by peer"))
+def test_http_verify_fails_fast_when_container_has_exited(
+    mock_get, mock_logs, mock_alive, mock_sleep
+):
+    """
+    _verify_http must bail immediately (no full-timeout wait) when the container
+    has exited, and the RunError must contain the container logs.
+    """
+    with pytest.raises(RunError, match="Container exited"):
+        _verify_http(55000, "/", container_id="deadbeef", timeout_s=60, emit_log=lambda _: None)
+    # Proof of fast-fail: sleep was never reached (exit happens before it)
+    mock_sleep.assert_not_called()
+
+
+@patch("app.agent.runner.time.sleep")
+@patch("app.agent.runner._is_container_running", return_value=False)
+@patch("app.agent.runner._docker_logs", return_value="Error: DATABASE_URL not set\nExiting.")
+def test_tcp_verify_fails_fast_when_container_has_exited(mock_logs, mock_alive, mock_sleep):
+    """
+    _verify_tcp must bail immediately when the container has exited.
+    """
+    with patch("app.agent.runner.socket.create_connection", side_effect=OSError("reset")):
+        with pytest.raises(RunError, match="Container exited"):
+            _verify_tcp(55000, container_id="deadbeef", timeout_s=60, emit_log=lambda _: None)
+    mock_sleep.assert_not_called()

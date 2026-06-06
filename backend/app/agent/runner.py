@@ -108,9 +108,11 @@ def run_and_verify(
 
     try:
         if healthcheck_type == "http":
-            _verify_http(host_port, healthcheck_detail, timeout_s=timeout_s, emit_log=emit_log)
+            _verify_http(host_port, healthcheck_detail,
+                         container_id=container_id, timeout_s=timeout_s, emit_log=emit_log)
         elif healthcheck_type == "tcp":
-            _verify_tcp(host_port, timeout_s=timeout_s, emit_log=emit_log)
+            _verify_tcp(host_port,
+                        container_id=container_id, timeout_s=timeout_s, emit_log=emit_log)
         elif healthcheck_type == "log":
             _verify_log(container_id, healthcheck_detail, timeout_s=timeout_s, emit_log=emit_log)
         else:
@@ -297,6 +299,7 @@ def _verify_http(
     port: int,
     path: str,
     *,
+    container_id: str | None = None,
     timeout_s: int,
     emit_log: Callable[[str], None],
 ) -> None:
@@ -316,6 +319,18 @@ def _verify_http(
             emit_log(f"[runner] HTTP {resp.status_code} — retrying…")
         except Exception as exc:
             emit_log(f"[runner] HTTP probe failed: {exc} — retrying…")
+
+        # After every failed probe, check whether the container itself is still
+        # running.  If it has exited (crash, OOM, missing env var, …) there is
+        # no point waiting for the full timeout — bail immediately and surface
+        # the container logs so the user sees the real error.
+        if container_id is not None and not _is_container_running(container_id):
+            logs = _docker_logs(container_id)
+            raise RunError(
+                f"Container exited before HTTP health check passed.\n"
+                f"Container logs:\n{logs}"
+            )
+
         time.sleep(_POLL_INTERVAL)
 
     raise RunError(f"HTTP health check timed out after {timeout_s}s: {url}")
@@ -324,6 +339,7 @@ def _verify_http(
 def _verify_tcp(
     port: int,
     *,
+    container_id: str | None = None,
     timeout_s: int,
     emit_log: Callable[[str], None],
 ) -> None:
@@ -338,6 +354,14 @@ def _verify_tcp(
                 return
         except OSError as exc:
             emit_log(f"[runner] TCP {port} not yet open: {exc} — retrying…")
+
+        if container_id is not None and not _is_container_running(container_id):
+            logs = _docker_logs(container_id)
+            raise RunError(
+                f"Container exited before TCP health check passed.\n"
+                f"Container logs:\n{logs}"
+            )
+
         time.sleep(_POLL_INTERVAL)
 
     raise RunError(f"TCP health check timed out after {timeout_s}s on port {port}")
@@ -369,6 +393,15 @@ def _verify_log(
 
 
 # ── Utility ───────────────────────────────────────────────────────────────────
+
+
+def _is_container_running(container_id: str) -> bool:
+    """Return True if *container_id* is currently in the 'running' state."""
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.State.Running}}", container_id],
+        capture_output=True, text=True, timeout=5,
+    )
+    return result.stdout.strip().lower() == "true"
 
 
 def _parse_port(detail: str) -> int | None:
