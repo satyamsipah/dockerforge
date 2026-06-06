@@ -12,6 +12,8 @@ google-genai>=1.5.0
 # --- HTTP client for health-check polling (Phase 5) ---
 httpx>=0.27.0
 
+# SSE is implemented via Starlette's StreamingResponse (no extra dep needed)
+
 # --- Dev / test ---
 pytest>=8.0
 

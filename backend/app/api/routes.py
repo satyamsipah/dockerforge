@@ -1,13 +1,25 @@
 """
 API routes for DockerForge.
 
-Phase 4 implements POST /api/forge (starts a pipeline job) and
-GET /api/forge/{job_id} (job status + events).
-GET /api/forge/{job_id}/stream (SSE) remains a 501 stub until Phase 6.
+Phase 6 completes the SSE stream endpoint.  The generator:
+  1. Picks up where the client left off via ``Last-Event-ID`` (safe reconnect).
+  2. Drains all buffered events from the job store.
+  3. Polls for new events (100 ms intervals) while the job is still running.
+  4. Closes the stream once the job reaches ``done`` or ``failed``, or the
+     client disconnects.
+
+SSE is implemented with Starlette's built-in ``StreamingResponse``
+(``text/event-stream`` media type) — no third-party library needed.
 """
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
-from fastapi.responses import JSONResponse
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, HttpUrl
 
 from app import __version__
@@ -65,9 +77,9 @@ async def start_forge(
     Validate the GitHub repo URL, create a forge job, and kick off the
     pipeline in a background thread.
 
-    Returns immediately with a ``job_id``.  Poll ``GET /api/forge/{job_id}``
-    for status, or consume the SSE stream at ``GET /api/forge/{job_id}/stream``
-    (available from Phase 6).
+    Returns immediately with a ``job_id``.  Consume live events from
+    ``GET /api/forge/{job_id}/stream`` or poll
+    ``GET /api/forge/{job_id}`` for status.
     """
     url = str(body.repo_url)
     try:
@@ -76,8 +88,6 @@ async def start_forge(
         raise HTTPException(status_code=422, detail=str(exc))
 
     job = create_job(url)
-    # run_pipeline_background uses asyncio.to_thread internally, so the
-    # blocking subprocess calls never touch the event loop.
     background_tasks.add_task(run_pipeline_background, job.job_id)
 
     return ForgeJobStarted(
@@ -102,12 +112,7 @@ class ForgeJobStatus(BaseModel):
 
 @router.get("/forge/{job_id}", response_model=ForgeJobStatus, tags=["forge"])
 def get_forge_job(job_id: str) -> ForgeJobStatus:
-    """
-    Return the current status and event count for a job.
-
-    Useful for polling and for integration tests.  The full event list
-    (and the live stream) are exposed via the SSE endpoint in Phase 6.
-    """
+    """Return the current status and event count for a job."""
     job = get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
@@ -121,23 +126,55 @@ def get_forge_job(job_id: str) -> ForgeJobStatus:
 
 
 # --------------------------------------------------------------------------- #
-# Forge — SSE stream (Phase 6 stub)
+# Forge — SSE stream
 # --------------------------------------------------------------------------- #
 
-@router.get(
-    "/forge/{job_id}/stream",
-    status_code=status.HTTP_501_NOT_IMPLEMENTED,
-    tags=["forge"],
-)
-def stream_forge(job_id: str) -> JSONResponse:
+@router.get("/forge/{job_id}/stream", tags=["forge"])
+async def stream_forge(request: Request, job_id: str) -> StreamingResponse:
     """
-    Server-Sent Events stream of typed job events
-    (``step_started``, ``log_line``, ``attempt``, ``build_result``,
-    ``run_result``, ``done``, ``error``).
+    Server-Sent Events stream of typed job events.
 
-    SSE wiring is implemented in Phase 6.
+    Event types: ``step_started``, ``log_line``, ``attempt``,
+    ``build_result``, ``run_result``, ``done``, ``error``.
+
+    Each SSE message carries a numeric ``id`` so clients can resume
+    mid-stream after a reconnect via the ``Last-Event-ID`` header.
+
+    The stream closes once the job reaches ``done`` or ``failed``.
     """
-    return JSONResponse(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        content={"detail": f"SSE stream for job '{job_id}' arrives in Phase 6."},
+    job = get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+
+    async def _event_stream() -> AsyncIterator[str]:
+        # Resume support: start from the event *after* the last one received.
+        try:
+            sent = int(request.headers.get("last-event-id", "")) + 1
+        except (ValueError, TypeError):
+            sent = 0
+
+        while True:
+            # Drain all buffered events since last send.
+            while sent < len(job.events):
+                data = json.dumps(job.events[sent])
+                yield f"id: {sent}\ndata: {data}\n\n"
+                sent += 1
+
+            # Close if the pipeline has finished.
+            if job.status in ("done", "failed"):
+                break
+
+            # Job still running — wait, then check for client disconnect.
+            await asyncio.sleep(0.1)
+            if await request.is_disconnected():
+                break
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering for live stream
+            "Connection": "keep-alive",
+        },
     )
