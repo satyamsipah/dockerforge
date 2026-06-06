@@ -25,9 +25,14 @@ class Settings(BaseSettings):
     app_name: str = "DockerForge"
     debug: bool = False
 
-    # --- LLM provider (Google Gemini) — used from Phase 3 onward ---
+    # --- LLM provider ---
+    # When GEMINI_BASE_URL is empty, the native google-genai SDK is used.
+    # When set (e.g. https://openrouter.ai/api/v1), the OpenAI-compatible
+    # client is used instead — works with OpenRouter, LiteLLM, and any
+    # other proxy that speaks the OpenAI chat-completions API.
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
+    gemini_base_url: str = ""  # leave empty for direct Gemini; set for OpenRouter etc.
 
     # --- CORS: which frontend origins may call the API ---
     cors_origins: str = "http://localhost:5173"

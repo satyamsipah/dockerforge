@@ -1,29 +1,28 @@
 """
-Dockerfile generator — one Gemini call that turns a RepoProfile into a
-validated GeneratorOutput.
+Dockerfile generator — turns a RepoProfile into a validated GeneratorOutput.
 
-Design decisions
-────────────────
-- One call per attempt.  The retry loop in the orchestrator (Phase 4) calls
-  ``generate_dockerfile`` for the initial attempt and ``fix_dockerfile`` for
-  each subsequent one.  Keeping them separate keeps the prompts focused and
-  the call graph easy to trace.
-- Structured output (JSON mode + response_schema=GeneratorOutput).  Passing
-  the Pydantic model as ``response_schema`` lets the Gemini SDK enforce the
-  schema before we see the response — no regex, no prose-scraping.  If the
-  model produces a structurally invalid response, the SDK raises rather than
-  silently returning garbage.
-- Prompt sends the RepoProfile, not raw files.  The profile is already the
-  distilled, token-efficient representation of the repo (built in Phase 2).
-  The key_files field contains the few manifests + entry file that matter.
-- No retry inside this module.  A GeneratorError propagates up to the
-  orchestrator, which decides whether to retry or surface the failure.
+Two LLM backends are supported, selected by the GEMINI_BASE_URL env var:
+
+  GEMINI_BASE_URL empty (default)
+    → google-genai SDK with response_schema=GeneratorOutput (native JSON mode).
+      The SDK enforces the Pydantic schema server-side before we see the response.
+
+  GEMINI_BASE_URL set (e.g. https://openrouter.ai/api/v1)
+    → openai-compatible client (works with OpenRouter, LiteLLM, any OAI proxy).
+      JSON mode is requested via response_format and the schema is embedded in
+      the system prompt.  The response is parsed manually with model_validate_json.
+
+In both cases the public API is identical: generate_dockerfile / fix_dockerfile
+return a GeneratorOutput or raise GeneratorError.
 """
 
 from __future__ import annotations
 
 import json
+import re
 
+# google-genai is always installed (native Gemini path).
+# openai is lazily imported inside _call_openai_compat so it's optional.
 from google import genai
 from google.genai import types
 
@@ -43,10 +42,9 @@ def generate_dockerfile(profile: RepoProfile) -> GeneratorOutput:
     """
     Generate a Dockerfile for *profile* (first attempt).
 
-    :raises GeneratorError: API key missing, API call failed, or response
-        could not be parsed into :class:`GeneratorOutput`.
+    :raises GeneratorError: API key missing, call failed, or unparseable response.
     """
-    return _call_gemini(_build_generation_prompt(profile))
+    return _call_llm(_build_generation_prompt(profile))
 
 
 def fix_dockerfile(
@@ -56,37 +54,38 @@ def fix_dockerfile(
     attempt_number: int,
 ) -> GeneratorOutput:
     """
-    Ask the model for a *targeted fix* given a previous failing Dockerfile.
-
-    Called by the orchestrator's retry loop (Phase 4).  The prompt explicitly
-    asks for a surgical edit rather than a from-scratch rewrite so that the
-    model's fix reasoning is traceable.
+    Ask the model for a targeted fix given a previous failing Dockerfile.
 
     :raises GeneratorError: same as :func:`generate_dockerfile`.
     """
-    return _call_gemini(
+    return _call_llm(
         _build_fix_prompt(profile, previous_dockerfile, build_error_tail, attempt_number)
     )
 
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+# ── Router ────────────────────────────────────────────────────────────────────
 
 
-def _call_gemini(prompt: str) -> GeneratorOutput:
-    """
-    Make one Gemini API call with JSON mode and return the parsed output.
-
-    The SDK's ``response_schema`` parameter enforces the GeneratorOutput shape
-    before we see the response.  If parsing still fails (e.g. the model
-    produces a structurally valid JSON that fails our Pydantic validators), we
-    re-raise as :exc:`GeneratorError` with a useful preview.
-    """
+def _call_llm(prompt: str) -> GeneratorOutput:
+    """Dispatch to the right backend based on GEMINI_BASE_URL."""
     settings = get_settings()
     if not settings.gemini_api_key:
         raise GeneratorError(
             "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
         )
+    if settings.gemini_base_url:
+        return _call_openai_compat(prompt, settings)
+    return _call_gemini_native(prompt, settings)
 
+
+# ── Backend A: native google-genai (direct Gemini, no base-url) ───────────────
+
+
+def _call_gemini_native(prompt: str, settings) -> GeneratorOutput:  # type: ignore[type-arg]
+    """
+    Use the google-genai SDK with response_schema for strict structured output.
+    The SDK enforces GeneratorOutput's shape before we see the response.
+    """
     client = genai.Client(api_key=settings.gemini_api_key)
 
     try:
@@ -101,8 +100,7 @@ def _call_gemini(prompt: str) -> GeneratorOutput:
     except Exception as exc:
         raise GeneratorError(f"Gemini API call failed: {exc}") from exc
 
-    # Prefer the SDK's native Pydantic parse (set when response_schema is a
-    # Pydantic class); fall back to manual JSON parsing.
+    # Prefer the SDK's native Pydantic parse; fall back to manual JSON parsing.
     if getattr(response, "parsed", None) is not None:
         return response.parsed  # type: ignore[return-value]
 
@@ -114,6 +112,72 @@ def _call_gemini(prompt: str) -> GeneratorOutput:
             f"Could not parse Gemini response into GeneratorOutput.\n"
             f"Response preview (first 400 chars):\n{preview}"
         ) from exc
+
+
+# ── Backend B: OpenAI-compatible client (OpenRouter, LiteLLM, …) ─────────────
+
+
+def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: ignore[type-arg]
+    """
+    Use the openai package pointed at GEMINI_BASE_URL.
+
+    Structured output is requested two ways:
+      1. response_format={"type": "json_object"} — most OAI-proxy models honour this.
+      2. The JSON schema is embedded in the system prompt as a belt-and-suspenders
+         measure for models that ignore response_format.
+    """
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise GeneratorError(
+            "The 'openai' package is required when GEMINI_BASE_URL is set. "
+            "Run: pip install openai"
+        ) from exc
+
+    client = OpenAI(
+        api_key=settings.gemini_api_key,
+        base_url=settings.gemini_base_url,
+    )
+
+    schema = GeneratorOutput.model_json_schema()
+    system_msg = (
+        "You are a Docker expert. "
+        "Respond ONLY with a valid JSON object — no markdown fences, no prose.\n"
+        "The JSON must match this schema exactly:\n"
+        f"{json.dumps(schema, indent=2)}"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=settings.gemini_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        raise GeneratorError(f"OpenAI-compat API call failed: {exc}") from exc
+
+    content = response.choices[0].message.content or ""
+    content = _strip_code_fences(content).strip()
+
+    try:
+        return GeneratorOutput.model_validate_json(content)
+    except Exception as exc:
+        preview = content[:400]
+        raise GeneratorError(
+            f"Could not parse LLM response into GeneratorOutput.\n"
+            f"Response preview (first 400 chars):\n{preview}"
+        ) from exc
+
+
+def _strip_code_fences(text: str) -> str:
+    """Remove ```json … ``` wrapping that some models add despite JSON-only instructions."""
+    return re.sub(r"^```[a-z]*\n?", "", re.sub(r"\n?```$", "", text.strip()))
+
+
+# ── Prompt builders ───────────────────────────────────────────────────────────
 
 
 def _build_generation_prompt(profile: RepoProfile) -> str:
@@ -163,13 +227,7 @@ def _build_fix_prompt(
     build_error_tail: str,
     attempt_number: int,
 ) -> str:
-    """
-    Prompt for a targeted fix of a failing Dockerfile.
-
-    We send the model the previous Dockerfile and the build error tail so it can
-    reason about root cause and produce a surgical edit — not a from-scratch
-    rewrite.  The attempt number helps it understand how many tries remain.
-    """
+    """Prompt for a targeted fix of a failing Dockerfile."""
     meta = {
         "language": profile.language,
         "framework": profile.framework,
