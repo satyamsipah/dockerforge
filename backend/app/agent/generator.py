@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 # google-genai is always installed (native Gemini path).
 # openai is lazily imported inside _call_openai_compat so it's optional.
 from google import genai
 from google.genai import types
+
+_RATE_LIMIT_MAX_RETRIES = 3   # max 429 retries for the OpenRouter/OAI-compat path
+_RATE_LIMIT_DEFAULT_WAIT = 30  # seconds to wait if the server doesn't say
 
 from app.config import get_settings
 from app.models.generator_output import GeneratorOutput
@@ -125,9 +129,14 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
       1. response_format={"type": "json_object"} — most OAI-proxy models honour this.
       2. The JSON schema is embedded in the system prompt as a belt-and-suspenders
          measure for models that ignore response_format.
+
+    429 rate-limit errors are retried up to _RATE_LIMIT_MAX_RETRIES times, honouring
+    the Retry-After delay from OpenRouter's metadata (or falling back to a default
+    back-off).  This function is always called from a background thread, so
+    time.sleep() does not block the async event loop.
     """
     try:
-        from openai import OpenAI
+        from openai import OpenAI, RateLimitError as OAIRateLimitError
     except ImportError as exc:
         raise GeneratorError(
             "The 'openai' package is required when GEMINI_BASE_URL is set. "
@@ -147,17 +156,30 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
         f"{json.dumps(schema, indent=2)}"
     )
 
-    try:
-        response = client.chat.completions.create(
-            model=settings.gemini_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-    except Exception as exc:
-        raise GeneratorError(f"OpenAI-compat API call failed: {exc}") from exc
+    last_exc: Exception | None = None
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=settings.gemini_model,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            break  # success — fall through to response parsing
+        except OAIRateLimitError as exc:
+            last_exc = exc
+            wait = _extract_retry_after(exc) or (_RATE_LIMIT_DEFAULT_WAIT * (attempt + 1))
+            if attempt < _RATE_LIMIT_MAX_RETRIES - 1:
+                time.sleep(wait)
+        except Exception as exc:
+            raise GeneratorError(f"OpenAI-compat API call failed: {exc}") from exc
+    else:
+        raise GeneratorError(
+            f"OpenAI-compat API call failed after {_RATE_LIMIT_MAX_RETRIES} attempts "
+            f"(provider rate-limited): {last_exc}"
+        ) from last_exc
 
     content = response.choices[0].message.content or ""
     content = _strip_code_fences(content).strip()
@@ -170,6 +192,33 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
             f"Could not parse LLM response into GeneratorOutput.\n"
             f"Response preview (first 400 chars):\n{preview}"
         ) from exc
+
+
+def _extract_retry_after(exc: Exception) -> float | None:
+    """
+    Extract the retry delay (seconds) from an OpenRouter/OAI-proxy RateLimitError.
+
+    OpenRouter embeds the delay in error.metadata.retry_after_seconds.
+    Falls back to the standard Retry-After response header.
+    Returns None if neither is present.
+    """
+    # OpenRouter embeds it in the parsed error body
+    try:
+        body = getattr(exc, "body", None)
+        if isinstance(body, dict):
+            return float(body["error"]["metadata"]["retry_after_seconds"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    # Standard HTTP header fallback
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            after = resp.headers.get("Retry-After")
+            if after:
+                return float(after)
+    except (AttributeError, ValueError):
+        pass
+    return None
 
 
 def _strip_code_fences(text: str) -> str:

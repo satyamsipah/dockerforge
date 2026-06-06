@@ -14,7 +14,7 @@ What we're verifying:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -254,6 +254,162 @@ def test_unparseable_response_raises_generator_error(mock_client_cls, monkeypatc
 
     with pytest.raises(GeneratorError, match="Could not parse"):
         generate_dockerfile(_flask_profile())
+
+
+# ── OpenRouter / OAI-compat path ──────────────────────────────────────────────
+
+
+def _make_rate_limit_error(retry_after: float):
+    """
+    Build a real openai.RateLimitError that looks like an OpenRouter 429.
+
+    We create it properly via its constructor so isinstance checks work and
+    it can actually be raised by mock side_effect machinery.
+    httpx.Response requires a request to be attached; we supply a dummy one.
+    """
+    import json as _json
+
+    import httpx
+    from openai import RateLimitError
+
+    body = {
+        "error": {
+            "message": "Provider returned error",
+            "code": 429,
+            "metadata": {"retry_after_seconds": retry_after},
+        }
+    }
+    # httpx.Response.request must be set or accessing it raises RuntimeError
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    resp = httpx.Response(
+        status_code=429,
+        content=_json.dumps(body).encode(),
+        headers={"Retry-After": str(int(retry_after)), "content-type": "application/json"},
+        request=req,
+    )
+    return RateLimitError("Provider returned error", response=resp, body=body)
+
+
+# ── Patch target for OAI-compat tests ─────────────────────────────────────────
+#
+# `from openai import OpenAI` inside _call_openai_compat resolves from the
+# real `openai` module at call time — so we must patch *openai.OpenAI*, NOT
+# a generator-module attribute.  Patching the source module is the canonical
+# approach when the import is inside a function body.
+_OAI_CLS_TARGET = "openai.OpenAI"
+
+
+@patch("app.agent.generator.time.sleep")
+@patch(_OAI_CLS_TARGET)
+def test_openrouter_path_succeeds_on_first_try(mock_oai_cls, mock_sleep, monkeypatch):
+    """When GEMINI_BASE_URL is set the OAI-compat path is used and returns output."""
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    get_settings.cache_clear()
+
+    valid_json = _valid_output().model_dump_json()
+    mock_choice = MagicMock()
+    mock_choice.message.content = valid_json
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+    mock_oai_cls.return_value.chat.completions.create.return_value = mock_response
+
+    result = generate_dockerfile(_flask_profile())
+
+    assert isinstance(result, GeneratorOutput)
+    assert result.exposed_port == 5000
+    mock_sleep.assert_not_called()  # no rate-limit wait on first success
+
+
+@patch("app.agent.generator.time.sleep")
+@patch(_OAI_CLS_TARGET)
+def test_openrouter_retries_on_429_then_succeeds(mock_oai_cls, mock_sleep, monkeypatch):
+    """A single 429 should be retried; the second call succeeds."""
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    get_settings.cache_clear()
+
+    rate_err = _make_rate_limit_error(retry_after=27.0)
+    valid_json = _valid_output().model_dump_json()
+    mock_choice = MagicMock()
+    mock_choice.message.content = valid_json
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+
+    create_mock = mock_oai_cls.return_value.chat.completions.create
+    create_mock.side_effect = [rate_err, mock_response]
+
+    result = generate_dockerfile(_flask_profile())
+
+    assert isinstance(result, GeneratorOutput)
+    assert create_mock.call_count == 2
+    mock_sleep.assert_called_once_with(27.0)  # honours Retry-After from metadata
+
+
+@patch("app.agent.generator.time.sleep")
+@patch(_OAI_CLS_TARGET)
+def test_openrouter_raises_after_max_retries(mock_oai_cls, mock_sleep, monkeypatch):
+    """Three consecutive 429s should raise GeneratorError (not loop forever)."""
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    get_settings.cache_clear()
+
+    rate_err = _make_rate_limit_error(retry_after=15.0)
+    create_mock = mock_oai_cls.return_value.chat.completions.create
+    create_mock.side_effect = [rate_err, rate_err, rate_err]
+
+    with pytest.raises(GeneratorError, match="rate-limited"):
+        generate_dockerfile(_flask_profile())
+
+    assert create_mock.call_count == 3         # tried 3 times
+    assert mock_sleep.call_count == 2          # slept between attempts 1→2 and 2→3
+
+
+@patch("app.agent.generator.time.sleep")
+@patch(_OAI_CLS_TARGET)
+def test_openrouter_falls_back_to_default_wait_if_no_retry_after(
+    mock_oai_cls, mock_sleep, monkeypatch
+):
+    """If the 429 has no retry_after metadata the default back-off is used."""
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    get_settings.cache_clear()
+
+    import httpx
+    from openai import RateLimitError
+
+    # 429 with no retry_after in body or headers
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    bare_resp = httpx.Response(
+        status_code=429,
+        content=b'{"error": {"message": "rate limited", "code": 429, "metadata": {}}}',
+        headers={"content-type": "application/json"},
+        request=req,
+    )
+    bare_err = RateLimitError(
+        "rate limited",
+        response=bare_resp,
+        body={"error": {"message": "rate limited", "code": 429, "metadata": {}}},
+    )
+
+    valid_json = _valid_output().model_dump_json()
+    mock_choice = MagicMock()
+    mock_choice.message.content = valid_json
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+
+    create_mock = mock_oai_cls.return_value.chat.completions.create
+    create_mock.side_effect = [bare_err, mock_response]
+
+    result = generate_dockerfile(_flask_profile())
+
+    assert isinstance(result, GeneratorOutput)
+    # Default wait for attempt 0 is _RATE_LIMIT_DEFAULT_WAIT * (0+1) = 30
+    mock_sleep.assert_called_once_with(30)
 
 
 # ── GeneratorOutput Pydantic validators ───────────────────────────────────────
