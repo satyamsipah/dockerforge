@@ -96,11 +96,11 @@ def run_and_verify(
         )
 
     # Detached modes: http, tcp, log
-    port = container_port or _parse_port(healthcheck_detail)
-    container_id = _start_detached(
+    container_port = container_port or _parse_port(healthcheck_detail)
+    container_id, host_port = _start_detached(
         image_tag,
         container_name=container_name,
-        port=port,
+        container_port=container_port,
         memory_limit=memory_limit,
         cpus_limit=cpus_limit,
         emit_log=emit_log,
@@ -108,9 +108,9 @@ def run_and_verify(
 
     try:
         if healthcheck_type == "http":
-            _verify_http(port, healthcheck_detail, timeout_s=timeout_s, emit_log=emit_log)
+            _verify_http(host_port, healthcheck_detail, timeout_s=timeout_s, emit_log=emit_log)
         elif healthcheck_type == "tcp":
-            _verify_tcp(port, timeout_s=timeout_s, emit_log=emit_log)
+            _verify_tcp(host_port, timeout_s=timeout_s, emit_log=emit_log)
         elif healthcheck_type == "log":
             _verify_log(container_id, healthcheck_detail, timeout_s=timeout_s, emit_log=emit_log)
         else:
@@ -189,20 +189,30 @@ def _start_detached(
     image_tag: str,
     *,
     container_name: str,
-    port: int | None,
+    container_port: int | None,
     memory_limit: str,
     cpus_limit: str,
     emit_log: Callable[[str], None],
-) -> str:
-    """Run *image_tag* in detached mode; return the container ID."""
+) -> tuple[str, int | None]:
+    """
+    Run *image_tag* in detached mode.
+
+    Returns ``(container_id, host_port)`` where *host_port* is the OS-assigned
+    port on the host side of the mapping (or ``None`` if no port mapping was
+    requested).
+
+    We always use ``-p 0:{container_port}`` so the OS picks a free host port,
+    avoiding "port already allocated" errors when the natural port (e.g. 3000
+    or 8000) is already in use by another process on the host.
+    """
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         "--memory", memory_limit,
         "--cpus", cpus_limit,
     ]
-    if port:
-        cmd += ["-p", f"{port}:{port}"]
+    if container_port:
+        cmd += ["-p", f"0:{container_port}"]   # 0 → let the OS pick a free host port
     cmd.append(image_tag)
 
     emit_log(f"[runner] docker run -d {image_tag}")
@@ -218,8 +228,44 @@ def _start_detached(
         raise RunError(f"Failed to start container: {err}")
 
     container_id = result.stdout.strip()
-    emit_log(f"[runner] container started: {container_id[:12]}")
-    return container_id
+
+    host_port: int | None = None
+    if container_port:
+        host_port = _query_host_port(container_id, container_port, emit_log=emit_log)
+
+    emit_log(f"[runner] container started: {container_id[:12]}, host port: {host_port}")
+    return container_id, host_port
+
+
+def _query_host_port(
+    container_id: str,
+    container_port: int,
+    *,
+    emit_log: Callable[[str], None],
+) -> int:
+    """
+    Return the host port Docker assigned for *container_port*.
+
+    ``docker port`` output looks like::
+
+        0.0.0.0:49152
+        :::49152
+
+    We take the last token after the final ``:`` on the first line.
+    """
+    result = subprocess.run(
+        ["docker", "port", container_id, str(container_port)],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        raise RunError(
+            f"Could not query host port for container port {container_port}: "
+            f"{result.stderr.strip()}"
+        )
+    raw = result.stdout.strip().splitlines()[0]
+    host_port = int(raw.rsplit(":", 1)[-1])
+    emit_log(f"[runner] container port {container_port} → host port {host_port}")
+    return host_port
 
 
 def _stop_and_remove(container_id: str, *, emit_log: Callable[[str], None]) -> None:

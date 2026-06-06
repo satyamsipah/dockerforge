@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
-from app.agent.runner import RunError, RunResult, run_and_verify
+from app.agent.runner import RunError, RunResult, _start_detached, run_and_verify
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ def test_exit_mode_emit_called(mock_run):
 @patch("app.agent.runner._stop_and_remove")
 @patch("app.agent.runner._docker_logs", return_value="Server started")
 @patch("app.agent.runner._verify_http")
-@patch("app.agent.runner._start_detached", return_value="abc123")
+@patch("app.agent.runner._start_detached", return_value=("abc123", 49152))
 def test_http_mode_success(mock_start, mock_verify, mock_logs, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "http", "healthcheck_detail": "/", "container_port": 8000}
     result = run_and_verify(**kwargs)
@@ -118,7 +118,7 @@ def test_http_mode_success(mock_start, mock_verify, mock_logs, mock_stop):
 
 @patch("app.agent.runner._stop_and_remove")
 @patch("app.agent.runner._verify_http", side_effect=RunError("HTTP timeout"))
-@patch("app.agent.runner._start_detached", return_value="abc123")
+@patch("app.agent.runner._start_detached", return_value=("abc123", 49152))
 def test_http_mode_timeout_raises_and_cleans_up(mock_start, mock_verify, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "http", "healthcheck_detail": "/", "container_port": 8000}
     with pytest.raises(RunError, match="HTTP timeout"):
@@ -132,7 +132,7 @@ def test_http_mode_timeout_raises_and_cleans_up(mock_start, mock_verify, mock_st
 @patch("app.agent.runner._stop_and_remove")
 @patch("app.agent.runner._docker_logs", return_value="")
 @patch("app.agent.runner._verify_tcp")
-@patch("app.agent.runner._start_detached", return_value="cid456")
+@patch("app.agent.runner._start_detached", return_value=("cid456", 49153))
 def test_tcp_mode_success(mock_start, mock_verify, mock_logs, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "tcp", "healthcheck_detail": "3000", "container_port": 3000}
     result = run_and_verify(**kwargs)
@@ -142,7 +142,7 @@ def test_tcp_mode_success(mock_start, mock_verify, mock_logs, mock_stop):
 
 @patch("app.agent.runner._stop_and_remove")
 @patch("app.agent.runner._verify_tcp", side_effect=RunError("TCP timeout"))
-@patch("app.agent.runner._start_detached", return_value="cid456")
+@patch("app.agent.runner._start_detached", return_value=("cid456", 49153))
 def test_tcp_mode_failure_cleans_up(mock_start, mock_verify, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "tcp", "healthcheck_detail": "3000", "container_port": 3000}
     with pytest.raises(RunError):
@@ -156,7 +156,7 @@ def test_tcp_mode_failure_cleans_up(mock_start, mock_verify, mock_stop):
 @patch("app.agent.runner._stop_and_remove")
 @patch("app.agent.runner._docker_logs", return_value="Listening on port 5000")
 @patch("app.agent.runner._verify_log")
-@patch("app.agent.runner._start_detached", return_value="cid789")
+@patch("app.agent.runner._start_detached", return_value=("cid789", None))
 def test_log_mode_success(mock_start, mock_verify, mock_logs, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "log", "healthcheck_detail": "Listening on"}
     result = run_and_verify(**kwargs)
@@ -179,9 +179,49 @@ def test_start_detached_failure_raises(mock_run):
 
 
 @patch("app.agent.runner._stop_and_remove")
-@patch("app.agent.runner._start_detached", return_value="cid")
+@patch("app.agent.runner._start_detached", return_value=("cid", None))
 def test_unknown_healthcheck_type_raises(mock_start, mock_stop):
     kwargs = {**_BASE, "healthcheck_type": "ftp", "healthcheck_detail": "something"}
     with pytest.raises(RunError, match="Unknown healthcheck type"):
         run_and_verify(**kwargs)
     mock_stop.assert_called_once()
+
+
+# ── Random host-port binding ──────────────────────────────────────────────────
+
+
+@patch("app.agent.runner._query_host_port", return_value=49152)
+@patch("app.agent.runner.subprocess.run")
+def test_start_detached_uses_zero_host_port(mock_run, mock_query):
+    """_start_detached must use -p 0:{port}, never -p {port}:{port}."""
+    mock_run.return_value = _make_run_mock(0, stdout="deadbeef\n")
+    cid, host_port = _start_detached(
+        "my-image",
+        container_name="test",
+        container_port=3000,
+        memory_limit="256m",
+        cpus_limit="0.5",
+        emit_log=lambda _: None,
+    )
+    cmd = mock_run.call_args.args[0]
+    assert "-p" in cmd
+    p_idx = cmd.index("-p")
+    mapping = cmd[p_idx + 1]
+    assert mapping == "0:3000", f"Expected '0:3000', got '{mapping}'"
+    assert host_port == 49152
+
+
+@patch("app.agent.runner._query_host_port", return_value=49152)
+@patch("app.agent.runner.subprocess.run")
+def test_http_verify_receives_host_port_not_container_port(mock_run, mock_query):
+    """_verify_http must be called with the OS-assigned host port."""
+    mock_run.return_value = _make_run_mock(0, stdout="deadbeef\n")
+    cid, host_port = _start_detached(
+        "my-image",
+        container_name="test",
+        container_port=3000,
+        memory_limit="256m",
+        cpus_limit="0.5",
+        emit_log=lambda _: None,
+    )
+    assert host_port == 49152   # NOT 3000
