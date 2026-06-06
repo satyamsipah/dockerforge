@@ -1,0 +1,40 @@
+@import 'tailwindcss';
+
+/*
+ * DockerForge design tokens.
+ * Dark, restrained, developer-tool aesthetic — monospace for anything
+ * log/code-shaped. Exposed as Tailwind theme variables so utilities like
+ * `bg-surface`, `text-accent`, `font-mono` work directly in JSX.
+ */
+@theme {
+  --color-bg: #0b0d12;
+  --color-surface: #12151c;
+  --color-surface-2: #171b24;
+  --color-border: #232834;
+  --color-text: #c8cdd6;
+  --color-text-dim: #7b8190;
+  --color-text-bright: #f2f4f8;
+  --color-accent: #2f9bff;
+  --color-accent-dim: #1e6fbf;
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-err: #f85149;
+
+  --font-mono: ui-monospace, 'SFMono-Regular', 'JetBrains Mono', Consolas, monospace;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

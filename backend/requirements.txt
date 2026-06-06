@@ -1,0 +1,10 @@
+# --- Web framework ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# --- Config / settings ---
+pydantic-settings==2.7.1
+python-dotenv==1.0.1
+
+# Later phases add: google-genai, docker, sse-starlette, httpx, pytest
+# (kept out until the phase that uses them, so the dependency list stays honest)
