@@ -25,14 +25,19 @@ class Settings(BaseSettings):
     app_name: str = "DockerForge"
     debug: bool = False
 
-    # --- LLM provider ---
-    # When GEMINI_BASE_URL is empty, the native google-genai SDK is used.
-    # When set (e.g. https://openrouter.ai/api/v1), the OpenAI-compatible
-    # client is used instead — works with OpenRouter, LiteLLM, and any
-    # other proxy that speaks the OpenAI chat-completions API.
+    # --- LLM provider: Groq (primary — OpenAI-compatible, no quota issues) ---
+    # Sign up at https://console.groq.com/ and create a free API key.
+    groq_api_key: str = ""
+    groq_model: str = "llama-3.3-70b-versatile"
+    groq_base_url: str = "https://api.groq.com/openai/v1"
+
+    # --- LLM provider: Google Gemini (fallback — native SDK or OAI-compat proxy) ---
+    # Used only when GROQ_API_KEY is not set.
+    # Leave GEMINI_BASE_URL empty for the direct google-genai SDK.
+    # Set it (e.g. https://openrouter.ai/api/v1) for any OAI-compat proxy.
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.0-flash"
-    gemini_base_url: str = ""  # leave empty for direct Gemini; set for OpenRouter etc.
+    gemini_base_url: str = ""
 
     # --- CORS: which frontend origins may call the API ---
     cors_origins: str = "http://localhost:5173"

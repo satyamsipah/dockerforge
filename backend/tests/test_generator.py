@@ -14,7 +14,7 @@ What we're verifying:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -222,10 +222,11 @@ def test_fix_dockerfile_passes_error_context(mock_client_cls, monkeypatch):
 
 
 def test_missing_api_key_raises_generator_error(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "")
     monkeypatch.setenv("GEMINI_API_KEY", "")
     get_settings.cache_clear()
 
-    with pytest.raises(GeneratorError, match="GEMINI_API_KEY"):
+    with pytest.raises(GeneratorError, match="GROQ_API_KEY"):
         generate_dockerfile(_flask_profile())
 
 
@@ -256,12 +257,12 @@ def test_unparseable_response_raises_generator_error(mock_client_cls, monkeypatc
         generate_dockerfile(_flask_profile())
 
 
-# ── OpenRouter / OAI-compat path ──────────────────────────────────────────────
+# ── Groq / OAI-compat path ────────────────────────────────────────────────────
 
 
 def _make_rate_limit_error(retry_after: float):
     """
-    Build a real openai.RateLimitError that looks like an OpenRouter 429.
+    Build a real openai.RateLimitError that looks like a Groq/OAI-proxy 429.
 
     We create it properly via its constructor so isinstance checks work and
     it can actually be raised by mock side_effect machinery.
@@ -303,9 +304,8 @@ _OAI_CLS_TARGET = "openai.OpenAI"
 @patch(_OAI_CLS_TARGET)
 def test_openrouter_path_succeeds_on_first_try(mock_oai_cls, mock_sleep, monkeypatch):
     """When GEMINI_BASE_URL is set the OAI-compat path is used and returns output."""
-    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
-    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # ensure Groq path is taken
     get_settings.cache_clear()
 
     valid_json = _valid_output().model_dump_json()
@@ -326,9 +326,8 @@ def test_openrouter_path_succeeds_on_first_try(mock_oai_cls, mock_sleep, monkeyp
 @patch(_OAI_CLS_TARGET)
 def test_openrouter_retries_on_429_then_succeeds(mock_oai_cls, mock_sleep, monkeypatch):
     """A single 429 should be retried; the second call succeeds."""
-    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
-    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # ensure Groq path is taken
     get_settings.cache_clear()
 
     rate_err = _make_rate_limit_error(retry_after=27.0)
@@ -352,9 +351,8 @@ def test_openrouter_retries_on_429_then_succeeds(mock_oai_cls, mock_sleep, monke
 @patch(_OAI_CLS_TARGET)
 def test_openrouter_raises_after_max_retries(mock_oai_cls, mock_sleep, monkeypatch):
     """Three consecutive 429s should raise GeneratorError (not loop forever)."""
-    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
-    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # ensure Groq path is taken
     get_settings.cache_clear()
 
     rate_err = _make_rate_limit_error(retry_after=15.0)
@@ -374,9 +372,8 @@ def test_openrouter_falls_back_to_default_wait_if_no_retry_after(
     mock_oai_cls, mock_sleep, monkeypatch
 ):
     """If the 429 has no retry_after metadata the default back-off is used."""
-    monkeypatch.setenv("GEMINI_API_KEY", "sk-or-test")
-    monkeypatch.setenv("GEMINI_BASE_URL", "https://openrouter.ai/api/v1")
-    monkeypatch.setenv("GEMINI_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # ensure Groq path is taken
     get_settings.cache_clear()
 
     import httpx

@@ -1,18 +1,19 @@
 """
 Dockerfile generator — turns a RepoProfile into a validated GeneratorOutput.
 
-Two LLM backends are supported, selected by the GEMINI_BASE_URL env var:
+Three LLM backends are supported, selected by priority:
 
-  GEMINI_BASE_URL empty (default)
-    → google-genai SDK with response_schema=GeneratorOutput (native JSON mode).
-      The SDK enforces the Pydantic schema server-side before we see the response.
+  1. GROQ_API_KEY set (default / recommended)
+     → openai-compatible client pointed at https://api.groq.com/openai/v1.
+       Fast, generous free tier, no regional quota issues.
 
-  GEMINI_BASE_URL set (e.g. https://openrouter.ai/api/v1)
-    → openai-compatible client (works with OpenRouter, LiteLLM, any OAI proxy).
-      JSON mode is requested via response_format and the schema is embedded in
-      the system prompt.  The response is parsed manually with model_validate_json.
+  2. GEMINI_API_KEY set + GEMINI_BASE_URL set
+     → openai-compatible client pointed at the given proxy (e.g. OpenRouter).
 
-In both cases the public API is identical: generate_dockerfile / fix_dockerfile
+  3. GEMINI_API_KEY set + GEMINI_BASE_URL empty
+     → native google-genai SDK with response_schema=GeneratorOutput.
+
+In all cases the public API is identical: generate_dockerfile / fix_dockerfile
 return a GeneratorOutput or raise GeneratorError.
 """
 
@@ -27,7 +28,7 @@ import time
 from google import genai
 from google.genai import types
 
-_RATE_LIMIT_MAX_RETRIES = 3   # max 429 retries for the OpenRouter/OAI-compat path
+_RATE_LIMIT_MAX_RETRIES = 3   # max 429 retries for the OAI-compat path
 _RATE_LIMIT_DEFAULT_WAIT = 30  # seconds to wait if the server doesn't say
 
 from app.config import get_settings
@@ -71,15 +72,37 @@ def fix_dockerfile(
 
 
 def _call_llm(prompt: str) -> GeneratorOutput:
-    """Dispatch to the right backend based on GEMINI_BASE_URL."""
+    """
+    Dispatch to the right backend (priority order):
+      1. Groq          — GROQ_API_KEY set
+      2. OAI proxy     — GEMINI_API_KEY + GEMINI_BASE_URL set
+      3. Native Gemini — GEMINI_API_KEY set, GEMINI_BASE_URL empty
+    """
     settings = get_settings()
-    if not settings.gemini_api_key:
-        raise GeneratorError(
-            "GEMINI_API_KEY is not set. Copy .env.example to .env and add your key."
+
+    if settings.groq_api_key:
+        return _call_openai_compat(
+            prompt,
+            api_key=settings.groq_api_key,
+            base_url=settings.groq_base_url,
+            model=settings.groq_model,
         )
-    if settings.gemini_base_url:
-        return _call_openai_compat(prompt, settings)
-    return _call_gemini_native(prompt, settings)
+
+    if settings.gemini_api_key and settings.gemini_base_url:
+        return _call_openai_compat(
+            prompt,
+            api_key=settings.gemini_api_key,
+            base_url=settings.gemini_base_url,
+            model=settings.gemini_model,
+        )
+
+    if settings.gemini_api_key:
+        return _call_gemini_native(prompt, settings)
+
+    raise GeneratorError(
+        "No LLM credentials found. Set GROQ_API_KEY (recommended) "
+        "or GEMINI_API_KEY. Copy .env.example to .env and fill in a key."
+    )
 
 
 # ── Backend A: native google-genai (direct Gemini, no base-url) ───────────────
@@ -118,12 +141,18 @@ def _call_gemini_native(prompt: str, settings) -> GeneratorOutput:  # type: igno
         ) from exc
 
 
-# ── Backend B: OpenAI-compatible client (OpenRouter, LiteLLM, …) ─────────────
+# ── Backend B: OpenAI-compatible client (Groq, OpenRouter, LiteLLM, …) ───────
 
 
-def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: ignore[type-arg]
+def _call_openai_compat(
+    prompt: str,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+) -> GeneratorOutput:
     """
-    Use the openai package pointed at GEMINI_BASE_URL.
+    Use the openai package pointed at *base_url* (Groq, OpenRouter, etc.).
 
     Structured output is requested two ways:
       1. response_format={"type": "json_object"} — most OAI-proxy models honour this.
@@ -131,7 +160,7 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
          measure for models that ignore response_format.
 
     429 rate-limit errors are retried up to _RATE_LIMIT_MAX_RETRIES times, honouring
-    the Retry-After delay from OpenRouter's metadata (or falling back to a default
+    the Retry-After delay from the error body / header (or falling back to a default
     back-off).  This function is always called from a background thread, so
     time.sleep() does not block the async event loop.
     """
@@ -139,14 +168,11 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
         from openai import OpenAI, RateLimitError as OAIRateLimitError
     except ImportError as exc:
         raise GeneratorError(
-            "The 'openai' package is required when GEMINI_BASE_URL is set. "
+            "The 'openai' package is required for the Groq/OAI-compat path. "
             "Run: pip install openai"
         ) from exc
 
-    client = OpenAI(
-        api_key=settings.gemini_api_key,
-        base_url=settings.gemini_base_url,
-    )
+    client = OpenAI(api_key=api_key, base_url=base_url)
 
     schema = GeneratorOutput.model_json_schema()
     system_msg = (
@@ -160,7 +186,7 @@ def _call_openai_compat(prompt: str, settings) -> GeneratorOutput:  # type: igno
     for attempt in range(_RATE_LIMIT_MAX_RETRIES):
         try:
             response = client.chat.completions.create(
-                model=settings.gemini_model,
+                model=model,
                 messages=[
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt},
