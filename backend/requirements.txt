@@ -6,7 +6,10 @@ uvicorn[standard]==0.34.0
 pydantic-settings==2.7.1
 python-dotenv==1.0.1
 
-# --- Dev / test (Phase 2) ---
+# --- LLM provider (Phase 3) ---
+google-genai>=1.5.0
+
+# --- Dev / test ---
 pytest>=8.0
 
-# Later phases add: google-genai, docker, sse-starlette, httpx
+# Later phases add: docker, sse-starlette, httpx
