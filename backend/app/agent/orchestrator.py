@@ -4,14 +4,14 @@ Forge pipeline orchestrator — the agent loop.
 Entry point: ``run_pipeline_sync(job_id)`` or the async wrapper
 ``run_pipeline_background(job_id)`` for FastAPI background tasks.
 
-The loop (Section 3 of the spec):
+The loop:
 
     clone → analyze → generate ──→ build
                                     │
                             success?─┤
                                  yes │
                                      ▼
-                                   done   (Phase 5 will add run+verify here)
+                                 run+verify → done
                                  no  │
                               attempt < max?
                                  yes │
@@ -34,6 +34,9 @@ Design decisions
   to reason about a targeted fix; older errors add noise.
 - ``asyncio.to_thread`` keeps the blocking subprocess calls off the
   FastAPI event loop.
+- Run+verify is best-effort: a RunError does not fail the job — we still
+  emit "done" with run_success=False so the user gets the Dockerfile even
+  when the container health check cannot be confirmed.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ from app.agent.analyzer import analyze_repo
 from app.agent.builder import BuildTimeoutError, DockerNotAvailableError, build_image
 from app.agent.cloner import CloneError, InvalidRepoURLError, cloned_repo
 from app.agent.generator import GeneratorError, fix_dockerfile, generate_dockerfile
+from app.agent.runner import RunError, run_and_verify
 from app.config import get_settings
 from app.models.job import ForgeJob, clear_all_jobs, create_job, get_job
 
@@ -73,10 +77,13 @@ def _run_pipeline(
     clone_timeout_s: int,
     max_repo_mb: int,
     build_timeout_s: int,
+    run_timeout_s: int,
+    container_memory: str,
+    container_cpus: str,
     job_id: str,
 ) -> dict[str, Any] | None:
     """
-    Run the full clone → analyze → generate → build → retry loop.
+    Run the full clone → analyze → generate → build → run+verify loop.
 
     Every side-effect goes through *emit*.  Returns the serialised
     :class:`~app.models.generator_output.GeneratorOutput` on success,
@@ -130,7 +137,37 @@ def _run_pipeline(
                         "attempt": attempt,
                         "image_tag": image_tag,
                     })
-                    # Phase 5 will add run+verify here before emitting "done".
+
+                    # ── Run + verify ──────────────────────────────────────────
+                    _step(emit, "run")
+                    run_success = False
+                    run_message = ""
+                    run_error = ""
+                    try:
+                        run_result = run_and_verify(
+                            image_tag,
+                            healthcheck_type=output.healthcheck.type,
+                            healthcheck_detail=output.healthcheck.detail,
+                            container_port=output.exposed_port,
+                            container_name=f"dockerforge-{job_id[:12]}",
+                            timeout_s=run_timeout_s,
+                            memory_limit=container_memory,
+                            cpus_limit=container_cpus,
+                            emit_log=lambda line: _log(emit, line),
+                        )
+                        run_success = run_result.success
+                        run_message = run_result.message
+                    except RunError as exc:
+                        run_error = str(exc)
+                        emit({"type": "log_line", "line": f"[runner] {exc}"})
+
+                    emit({
+                        "type": "run_result",
+                        "success": run_success,
+                        "message": run_message,
+                        "error": run_error,
+                    })
+
                     output_dict = output.model_dump()
                     emit({
                         "type": "done",
@@ -139,6 +176,7 @@ def _run_pipeline(
                         "reasoning": output.reasoning,
                         "attempts": attempt,
                         "image_tag": image_tag,
+                        "run_success": run_success,
                         "output": output_dict,
                     })
                     return output_dict
@@ -210,6 +248,9 @@ def run_pipeline_sync(job_id: str) -> None:
         clone_timeout_s=settings.clone_timeout_seconds,
         max_repo_mb=settings.max_repo_mb,
         build_timeout_s=settings.build_timeout_seconds,
+        run_timeout_s=settings.run_timeout_seconds,
+        container_memory=settings.container_memory,
+        container_cpus=settings.container_cpus,
         job_id=job_id,
     )
 

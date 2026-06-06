@@ -32,12 +32,16 @@ class Settings(BaseSettings):
     # --- CORS: which frontend origins may call the API ---
     cors_origins: str = "http://localhost:5173"
 
-    # --- Agent guardrails (enforced in later phases) ---
+    # --- Agent guardrails ---
     clone_timeout_seconds: int = 60
     max_repo_mb: int = 200
     build_timeout_seconds: int = 600
     run_timeout_seconds: int = 60
     max_build_attempts: int = 3
+
+    # --- Container resource limits (Phase 5) ---
+    container_memory: str = "256m"
+    container_cpus: str = "0.5"
 
     @property
     def cors_origin_list(self) -> list[str]:
