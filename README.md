@@ -4,6 +4,8 @@
 > codebase, and generates + builds a working Dockerfile — self-correcting on
 > failure with a Gemini-powered retry loop.
 
+Watch the demo = https://www.youtube.com/watch?v=6rcZmW_oSo0
+
 DockerForge doesn't just ask an LLM to "write a Dockerfile." It runs a closed
 agent loop: **clone → analyse → generate → build → (reason & retry ×3) → run →
 verify**, streaming every step to the UI in real time over SSE.
